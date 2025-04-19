@@ -1,0 +1,212 @@
+Map<String, Integer> slaConfigMap = new Map<String, Integer>();
+Map<String, Integer> escalationGapMap = new Map<String, Integer>();
+Map<Id, User> allUsers = new Map<Id, User>();
+Map<Id, List<Case>> userToEscalatedCases = new Map<Id, List<Case>>();
+List<Case> casesToUpdate = new List<Case>();
+Id ceoUserId;
+ 
+public CaseEscalationBatch() {
+    for (Case_SLA_Configuration__mdt config : Case_SLA_Configuration__mdt.getAll().values()) {
+        String key = config.Case_Category__c + '|' + config.Case_Type__c + '|' + config.Case_Record_Type_Name__c;
+        slaConfigMap.put(key, config.SLA_Days__c != null ? Integer.valueOf(config.SLA_Days__c) : 15);
+        escalationGapMap.put(key, config.Escalation_Gap_Days__c != null ? Integer.valueOf(config.Escalation_Gap_Days__c) : 2);
+    }
+ 
+    for (User u : [SELECT Id, Name, ManagerId, Email, UserRole.Name FROM User WHERE Email != null AND isActive = true]) {
+        allUsers.put(u.Id, u);
+        if (u.UserRole.Name == 'CEO') {
+            ceoUserId = u.Id;
+        }
+    }
+}
+ 
+global Database.QueryLocator start(Database.BatchableContext context) {
+    return Database.getQueryLocator([
+        SELECT Id, OwnerId, Remarks__c, CreatedById, CreatedBy.Name, LMS_Loan_Number__c, CreatedDate, 
+               Status, Case_Type__c, Case_Category__c, Last_Escalated_On__c, CaseNumber, RecordType.Name 
+        FROM Case 
+        WHERE Status != 'Closed'
+    ]);
+}
+ 
+global void execute(Database.BatchableContext context, List<Case> scope) {
+    Map<Id, Case> caseMap = new Map<Id, Case>();
+    Map<Id, Id> caseToStartUserMap = new Map<Id, Id>();
+    DateTime now = System.now();
+    BusinessHours defaultBH = [SELECT Id FROM BusinessHours WHERE IsDefault = TRUE LIMIT 1];
+ 
+    for (Case c : scope) {
+        caseMap.put(c.Id, c);
+        Id startUser = (c.OwnerId != null && String.valueOf(c.OwnerId).startsWith('00G')) ? c.CreatedById : c.OwnerId;
+        caseToStartUserMap.put(c.Id, startUser);
+    }
+ 
+    for (Case c : scope) {
+        String key = c.Case_Category__c + '|' + c.Case_Type__c + '|' + c.RecordType.Name;
+        if (!slaConfigMap.containsKey(key)) continue;
+ 
+        Integer slaDays = slaConfigMap.get(key);
+        Integer gapDays = escalationGapMap.get(key);
+ 
+        Long slaMillis = slaDays * 9 * 60 * 60 * 1000L;
+        DateTime slaDue = BusinessHours.add(defaultBH.Id, c.CreatedDate, slaMillis);
+ 
+        if (now > slaDue || Test.isRunningTest()) {
+            DateTime lastEscalated = c.Last_Escalated_On__c != null ? c.Last_Escalated_On__c : c.CreatedDate;
+            Long elapsedBusinessMillis = BusinessHours.diff(defaultBH.Id, lastEscalated, now);
+            if (elapsedBusinessMillis == null || elapsedBusinessMillis < 0) continue;
+ 
+            Integer millisPerGap = gapDays * 9 * 60 * 60 * 1000;
+            if (elapsedBusinessMillis >= millisPerGap || Test.isRunningTest()) {
+                Id startUserId = c.OwnerId;
+                Id escalatedTo = getEscalatedManager(startUserId, 1);
+ 
+                if (escalatedTo != null && escalatedTo != c.OwnerId) {
+                    if (String.valueOf(c.OwnerId).startsWith('00G')) continue;
+ 
+                    c.OwnerId = escalatedTo;
+                    casesToUpdate.add(c);
+ 
+                    if (!userToEscalatedCases.containsKey(escalatedTo)) {
+                        userToEscalatedCases.put(escalatedTo, new List<Case>());
+                    }
+                    userToEscalatedCases.get(escalatedTo).add(c);
+                }
+            }
+        }
+    }
+}
+ 
+global void finish(Database.BatchableContext context) {
+    if (!casesToUpdate.isEmpty()) {
+        updateCasesInChunksWithRetry(casesToUpdate);
+    }
+ 
+    OrgWideEmailAddress[] orgWideAddresses = [SELECT Id FROM OrgWideEmailAddress LIMIT 1];
+    String instanceUrl = System.Url.getOrgDomainUrl().toExternalForm();
+    StaticResource logoResource = [SELECT Body FROM StaticResource WHERE Name = 'Your_Logo' LIMIT 1];
+    Blob logoBlob = logoResource.Body;
+    String base64Logo = EncodingUtil.base64Encode(logoBlob);
+    String mimeType = 'image/png';
+ 
+    List<Exception__c> lstOfException = new List<Exception__c>();
+ 
+    for (Id userId : userToEscalatedCases.keySet()) {
+        User u = allUsers.get(userId);
+        if (u == null || String.isBlank(u.Email)) continue;
+ 
+        String disclaimer = '';
+        User manager = u.ManagerId != null ? allUsers.get(u.ManagerId) : null;
+        if (manager != null && (manager.ManagerId == null || manager.Id == ceoUserId)) {
+            disclaimer = '<p><strong>Note: If these cases remain unresolved, the next escalation will be directed to the CEO.</strong></p>';
+        }
+ 
+        List<Case> caseList = userToEscalatedCases.get(userId);
+        String csv = 'Case Number,LMS Loan Number,Category,Type,CreatedBy,Created Date,Case Remarks\n';
+        String htmlRows = '';
+ 
+        for (Case c : caseList) {
+            csv += '"' + c.CaseNumber + '","' + String.valueOf(c.LMS_Loan_Number__c) + '","' + c.Case_Category__c + '","' +
+                   c.Case_Type__c + '","' + c.CreatedBy.Name + '","' + String.valueOf(c.CreatedDate) + '","' + c.Remarks__c + '"\n';
+ 
+            htmlRows += '<tr>' +
+                        '<td>' + c.CaseNumber + '</td>' +
+                        '<td>' + c.LMS_Loan_Number__c + '</td>' +
+                        '<td>' + c.Case_Category__c + '</td>' +
+                        '<td>' + c.Case_Type__c + '</td>' +
+                        '<td>' + c.CreatedBy.Name + '</td>' +
+                        '<td>' + c.CreatedDate.format() + '</td>' +
+                        '<td><a href="' + instanceUrl + '/' + c.Id + '" target="_blank">View Case</a></td>' +
+                        '</tr>';
+        }
+ 
+        Messaging.EmailFileAttachment attachment = new Messaging.EmailFileAttachment();
+        attachment.setFileName('Escalated_Cases.csv');
+        attachment.setBody(Blob.valueOf(csv));
+        attachment.setContentType('text/csv');
+ 
+        String htmlBody = '<p>Dear ' + u.Name + ',</p>' +
+            '<p>The following cases have been escalated to you:</p>' +
+            '<table border="1" cellpadding="5" cellspacing="0">' +
+            '<tr><th>Case Number</th><th>LMS Loan Number</th><th>Category</th><th>Type</th><th>Created By</th><th>Created Date</th><th>Case Link</th></tr>' +
+            htmlRows +
+            '</table>' + disclaimer +
+            '<br/><p>Regards,<br/>Admin</p>' +
+            '<br/><img src="data:' + mimeType + ';base64,' + base64Logo + '" alt="your logo" style="height:60px;" />';
+ 
+        Messaging.SingleEmailMessage email = new Messaging.SingleEmailMessage();
+        email.setToAddresses(new String[] { u.Email });
+        email.setCcAddresses(new String[] { 'abc@gmai.com' }); // Customize as needed
+        email.setSubject('Escalated Cases Notification');
+        email.setHtmlBody(htmlBody);
+        email.setFileAttachments(new Messaging.EmailFileAttachment[] { attachment });
+ 
+        if (!orgWideAddresses.isEmpty()) {
+            email.setOrgWideEmailAddressId(orgWideAddresses[0].Id);
+        }
+ 
+        Messaging.SendEmailResult[] results = Messaging.sendEmail(new Messaging.SingleEmailMessage[] { email });
+        if (results != null && results.size() > 0 && !results[0].isSuccess()) {
+            Exception__c objException = new Exception__c();
+            objException.Class_Name__c = 'CaseEscalationBatch';
+            objException.Object_Name__c = 'Case';
+            objException.Case_Message__c = results[0].getErrors()[0].getMessage();
+            objException.Exception_Type__c = 'Email Error';
+            lstOfException.add(objException);
+        }
+    }
+ 
+    if (!lstOfException.isEmpty()) {
+        insert lstOfException;
+    }
+}
+ 
+private Id getEscalatedManager(Id userId, Integer level) {
+    Id current = userId;
+    for (Integer i = 0; i < level; i++) {
+        User u = allUsers.get(current);
+        if (u == null || u.ManagerId == null) {
+            return ceoUserId;
+        }
+        current = u.ManagerId;
+    }
+    return current;
+}
+ 
+private void updateCasesInChunksWithRetry(List<Case> cases) {
+    final Integer CHUNK_SIZE = 200;
+    List<Case> failedUpdates = new List<Case>();
+ 
+    for (Integer i = 0; i < cases.size(); i += CHUNK_SIZE) {
+        Integer endIndex = Math.min(i + CHUNK_SIZE, cases.size());
+        List<Case> subList = cases.subList(i, endIndex);
+ 
+        try {
+            Utility.byPassCaseTrigger = true;
+            Database.SaveResult[] results = Database.update(subList, false);
+            Utility.byPassCaseTrigger = false;
+ 
+            for (Integer j = 0; j < results.size(); j++) {
+                if (!results[j].isSuccess()) {
+                    failedUpdates.add(subList[j]);
+                }
+            }
+        } catch (Exception ex) {
+            failedUpdates.addAll(subList);
+        }
+    }
+ 
+    if (!failedUpdates.isEmpty()) {
+        for (Integer i = 0; i < failedUpdates.size(); i += CHUNK_SIZE) {
+            Integer endIndex = Math.min(i + CHUNK_SIZE, failedUpdates.size());
+            List<Case> retryList = failedUpdates.subList(i, endIndex);
+            try {
+                Utility.byPassCaseTrigger = true;
+                Database.update(retryList, false);
+                Utility.byPassCaseTrigger = false;
+            } catch (Exception retryEx) {
+                System.debug('Retry failed for chunk: ' + retryEx.getMessage());
+            }
+        }
+    }
+}
